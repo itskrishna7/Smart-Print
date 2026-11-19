@@ -299,11 +299,13 @@ def _consume_rate_limit(
     endpoint: str,
     scopes: list[tuple[str, int, int]],
 ) -> None:
-    db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    db = None
+    cursor = None
     blocked_scope = None
     retry_after = 1
     try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
         for scope_name, limit, window_seconds in scopes:
             bucket_key = _rate_limit_key(scope_name)
             cursor.execute(
@@ -349,15 +351,24 @@ def _consume_rate_limit(
             )
         db.commit()
     except Exception:
-        db.rollback()
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                logger.exception(
+                    "security_event event=rate_limit_storage_rollback_error endpoint=%s",
+                    endpoint,
+                )
         logger.exception("security_event event=rate_limit_storage_error endpoint=%s", endpoint)
         raise HTTPException(
             status_code=503,
             detail="This service is temporarily unavailable. Please try again.",
         ) from None
     finally:
-        cursor.close()
-        db.close()
+        if cursor is not None:
+            cursor.close()
+        if db is not None:
+            db.close()
 
     if blocked_scope:
         logger.warning(

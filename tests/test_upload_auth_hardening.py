@@ -313,6 +313,24 @@ class AuthenticationRateLimitTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 429)
         self.assertEqual(error.exception.headers["Retry-After"], "600")
 
+    def test_rate_limit_database_connection_failure_returns_json_service_error(self):
+        request = make_request(path="/upload/presign")
+
+        with patch.object(
+            main,
+            "get_db_connection",
+            side_effect=RuntimeError("database connection detail"),
+        ):
+            with self.assertLogs(main.logger, level=logging.ERROR):
+                with self.assertRaises(HTTPException) as error:
+                    main._check_public_upload_rate_limit(request)
+
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertEqual(
+            error.exception.detail,
+            "This service is temporarily unavailable. Please try again.",
+        )
+
     def test_valid_login_still_succeeds(self):
         password_hash = main._hash_password("valid-password")
         connection = LoginConnection(
