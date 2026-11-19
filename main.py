@@ -87,6 +87,12 @@ AUTH_REGISTER_IP_LIMIT = _positive_int_setting("SMARTPRINT_AUTH_REGISTER_IP_LIMI
 AUTH_REGISTER_WINDOW_SECONDS = _positive_int_setting(
     "SMARTPRINT_AUTH_REGISTER_WINDOW_SECONDS", 60 * 60
 )
+PUBLIC_UPLOAD_RATE_WINDOW_SECONDS = _positive_int_setting(
+    "SMARTPRINT_PUBLIC_UPLOAD_RATE_WINDOW_SECONDS", 60 * 60
+)
+PUBLIC_UPLOAD_IP_LIMIT = _positive_int_setting(
+    "SMARTPRINT_PUBLIC_UPLOAD_IP_LIMIT", 60
+)
 APP_ENV = os.getenv("SMARTPRINT_ENV", "").strip().lower()
 if APP_ENV not in {"development", "production"}:
     raise RuntimeError(
@@ -344,10 +350,10 @@ def _consume_rate_limit(
         db.commit()
     except Exception:
         db.rollback()
-        logger.exception("security_event event=auth_rate_limit_storage_error endpoint=%s", endpoint)
+        logger.exception("security_event event=rate_limit_storage_error endpoint=%s", endpoint)
         raise HTTPException(
             status_code=503,
-            detail="Authentication is temporarily unavailable. Please try again.",
+            detail="This service is temporarily unavailable. Please try again.",
         ) from None
     finally:
         cursor.close()
@@ -355,7 +361,7 @@ def _consume_rate_limit(
 
     if blocked_scope:
         logger.warning(
-            "security_event event=auth_rate_limited endpoint=%s client_ip=%s scope=%s",
+            "security_event event=rate_limited endpoint=%s client_ip=%s scope=%s",
             endpoint,
             _client_ip(request),
             blocked_scope,
@@ -397,6 +403,20 @@ def _check_registration_rate_limit(request: Request) -> None:
                 f"register_ip:{_client_ip(request)}",
                 AUTH_REGISTER_IP_LIMIT,
                 AUTH_REGISTER_WINDOW_SECONDS,
+            )
+        ],
+    )
+
+
+def _check_public_upload_rate_limit(request: Request) -> None:
+    _consume_rate_limit(
+        request,
+        endpoint="public_upload",
+        scopes=[
+            (
+                f"public_upload_ip:{_client_ip(request)}",
+                PUBLIC_UPLOAD_IP_LIMIT,
+                PUBLIC_UPLOAD_RATE_WINDOW_SECONDS,
             )
         ],
     )
@@ -924,6 +944,14 @@ async def protect_owner_apis(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "frame-src 'self' blob:; form-action 'self'; script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+    )
     if owner_api or path.startswith("/qr/"):
         response.headers.setdefault("Cache-Control", "no-store")
     if APP_ENV == "production":
@@ -1131,11 +1159,15 @@ def register_owner(
 
 @app.post("/login/")
 def login_owner(request: Request, username: str = Form(...), password: str = Form(...)):
-    _check_login_rate_limit(request, username)
+    username = username.strip()
+    _check_login_rate_limit(request, username[:100])
+    if not username or len(username) > 100 or len(password) > 200:
+        logger.warning("security_event event=auth_login_failed client_ip=%s", _client_ip(request))
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
     db = get_db_connection()
     cursor = db.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT * FROM shop_owners WHERE username = %s", (username.strip(),))
+        cursor.execute("SELECT * FROM shop_owners WHERE username = %s", (username,))
         user = cursor.fetchone()
         password_valid, needs_upgrade = _verify_password(password, user.get("password") if user else None)
         if not user or not password_valid:
@@ -1201,6 +1233,7 @@ def logout_owner():
 
 @app.post("/analyze/")
 async def analyze_only_endpoint(request: Request):
+    _check_public_upload_rate_limit(request)
     async with _analyzed_request_uploads(request) as (_, documents, _, _, _):
         total_pages = sum(item["total_pages"] for item in documents)
         bw_pages = sum(item["bw_pages"] for item in documents)
@@ -1224,6 +1257,7 @@ async def analyze_only_endpoint(request: Request):
 
 @app.post("/upload/presign")
 async def presign_customer_upload(payload: PresignUploadRequest, request: Request):
+    _check_public_upload_rate_limit(request)
     if OBJECT_STORAGE is None:
         raise HTTPException(status_code=404, detail="Direct uploads are not enabled.")
     manifest = []
@@ -1284,6 +1318,7 @@ async def presign_customer_upload(payload: PresignUploadRequest, request: Reques
 
 @app.post("/upload/")
 async def upload_and_save_endpoint(request: Request):
+    _check_public_upload_rate_limit(request)
     async with _analyzed_request_uploads(request) as (
         staged_files,
         analyses,

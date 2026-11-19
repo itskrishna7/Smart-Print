@@ -316,6 +316,7 @@ class DirectUploadTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(main, "OBJECT_STORAGE", storage),
             patch.object(main, "get_db_connection", return_value=connection),
+            patch.object(main, "_check_public_upload_rate_limit"),
         ):
             result = await main.presign_customer_upload(
                 main.PresignUploadRequest(files=[
@@ -332,6 +333,7 @@ class DirectUploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_filename_and_actual_upload_size_limits_are_enforced(self):
         with (
             patch.object(main, "OBJECT_STORAGE", make_storage()),
+            patch.object(main, "_check_public_upload_rate_limit"),
             self.assertRaises(HTTPException) as invalid_file,
         ):
             await main.presign_customer_upload(
@@ -346,6 +348,7 @@ class DirectUploadTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(main, "OBJECT_STORAGE", make_storage()),
             patch.object(main, "get_db_connection", return_value=connection),
+            patch.object(main, "_check_public_upload_rate_limit"),
         ):
             with self.assertRaises(HTTPException) as oversized:
                 await main.presign_customer_upload(

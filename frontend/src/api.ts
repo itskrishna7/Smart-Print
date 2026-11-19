@@ -134,6 +134,9 @@ export interface ApiResult<T> {
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.headers.get("content-type")?.includes("application/json")) {
+    if (response.status === 429) {
+      throw new Error("Too many requests. Please wait a moment and retry.");
+    }
     throw new Error(`Request failed (${response.status}): the server returned an unexpected response.`);
   }
   const result = (await response.json()) as T & { status?: string; message?: string; detail?: string };

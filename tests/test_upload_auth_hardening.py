@@ -298,6 +298,21 @@ class AuthenticationRateLimitTests(unittest.TestCase):
 
         self.assertEqual(error.exception.status_code, 429)
 
+    def test_public_upload_throttle_is_shared_across_worker_connections(self):
+        request = make_request(path="/upload/presign")
+
+        with (
+            patch.object(main, "PUBLIC_UPLOAD_IP_LIMIT", 2),
+            patch.object(main, "PUBLIC_UPLOAD_RATE_WINDOW_SECONDS", 600),
+        ):
+            main._check_public_upload_rate_limit(request)
+            main._check_public_upload_rate_limit(request)
+            with self.assertRaises(HTTPException) as error:
+                main._check_public_upload_rate_limit(request)
+
+        self.assertEqual(error.exception.status_code, 429)
+        self.assertEqual(error.exception.headers["Retry-After"], "600")
+
     def test_valid_login_still_succeeds(self):
         password_hash = main._hash_password("valid-password")
         connection = LoginConnection(
@@ -339,6 +354,50 @@ class AuthenticationRateLimitTests(unittest.TestCase):
                 errors.append((error.exception.status_code, error.exception.detail))
 
         self.assertEqual(errors, [(401, "Invalid username or password.")] * 2)
+
+    def test_oversized_login_input_is_rejected_before_database_access(self):
+        with (
+            patch.object(main, "_check_login_rate_limit"),
+            patch.object(main, "get_db_connection") as get_connection,
+        ):
+            with self.assertRaises(HTTPException) as error:
+                main.login_owner(
+                    make_request(path="/login/"),
+                    username="owner",
+                    password="x" * 201,
+                )
+
+        self.assertEqual(error.exception.status_code, 401)
+        self.assertEqual(error.exception.detail, "Invalid username or password.")
+        get_connection.assert_not_called()
+
+
+class PublicUploadRateLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_upload_endpoints_apply_the_shared_rate_limit(self):
+        request = make_request()
+        endpoints = [
+            (main.analyze_only_endpoint, (request,)),
+            (main.presign_customer_upload, (
+                main.PresignUploadRequest(
+                    files=[main.PresignUploadFile(filename="document.pdf", size=10)]
+                ),
+                request,
+            )),
+            (main.upload_and_save_endpoint, (request,)),
+        ]
+
+        for endpoint, arguments in endpoints:
+            with self.subTest(endpoint=endpoint.__name__):
+                with patch.object(
+                    main,
+                    "_check_public_upload_rate_limit",
+                    side_effect=HTTPException(status_code=429, detail="Rate limited."),
+                ) as rate_limit:
+                    with self.assertRaises(HTTPException) as error:
+                        await endpoint(*arguments)
+
+                self.assertEqual(error.exception.status_code, 429)
+                rate_limit.assert_called_once_with(request)
 
 
 if __name__ == "__main__":

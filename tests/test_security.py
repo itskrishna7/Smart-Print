@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -7,6 +8,7 @@ os.environ["SMARTPRINT_ENV"] = "development"
 
 import main
 from fastapi import HTTPException
+from starlette.responses import Response
 from starlette.requests import Request
 
 
@@ -38,6 +40,30 @@ class SecurityTests(unittest.TestCase):
         self.assertIsNone(main._decode_session(token + "tampered"))
         with patch.object(main.time, "time", return_value=2**31):
             self.assertIsNone(main._decode_session(token))
+
+    def test_security_headers_include_compatible_content_security_policy(self):
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+                "scheme": "http",
+                "query_string": b"",
+                "http_version": "1.1",
+            }
+        )
+
+        async def next_response(_):
+            return Response()
+
+        response = asyncio.run(main.protect_owner_apis(request, next_response))
+
+        self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
+        self.assertIn("frame-src 'self' blob:", response.headers["Content-Security-Policy"])
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
 
     def test_customer_tracking_requires_the_order_token(self):
         token = "customer-only-random-token"

@@ -109,6 +109,7 @@ class IndependentAuditRegressionTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(main, "_analyzed_request_uploads", analyzed_uploads),
             patch.object(main, "_persist_customer_order", side_effect=persist_order),
+            patch.object(main, "_check_public_upload_rate_limit"),
         ):
             response = await main.protect_owner_apis(request, route)
 
