@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 os.environ["SMARTPRINT_ENV"] = "development"
@@ -92,7 +92,7 @@ class FileRetentionTests(unittest.TestCase):
             self.assertTrue(connection.committed)
             self.assertTrue(any("o.order_status = 'Completed'" in query for query, _ in cursor.queries))
             self.assertTrue(any("COUNT(DISTINCT beo.order_id)" in query for query, _ in cursor.queries))
-            age_seconds = (datetime.now() - cursor.cutoff).total_seconds()
+            age_seconds = (datetime.now(timezone.utc) - cursor.cutoff).total_seconds()
             self.assertAlmostEqual(age_seconds, main.FILE_RETENTION_DAYS * 24 * 60 * 60, delta=5)
 
     def test_file_deletion_rejects_paths_outside_upload_directory(self):

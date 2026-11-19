@@ -69,7 +69,7 @@ class RateLimitConnection:
     def __init__(self, store):
         self.store = store
 
-    def cursor(self, dictionary=False):
+    def cursor(self, **kwargs):
         return RateLimitCursor(self.store)
 
     def commit(self):
@@ -100,7 +100,7 @@ class LoginConnection:
     def __init__(self, user):
         self.user = user
 
-    def cursor(self, dictionary=False):
+    def cursor(self, **kwargs):
         return LoginCursor(self.user)
 
     def close(self):

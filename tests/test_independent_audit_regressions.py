@@ -35,6 +35,8 @@ class RecordingOrderCursor:
             return (7,)
         if "SELECT branch_id FROM branches" in self.current_query:
             return (12,)
+        if "INSERT INTO customers" in self.current_query:
+            return (13,)
         if "SELECT order_id FROM orders" in self.current_query:
             return None
         return None
@@ -160,7 +162,7 @@ class IndependentAuditRegressionTests(unittest.IsolatedAsyncioTestCase):
         customer_insert = next(
             params
             for query, params in connection.cursor_instance.queries
-            if query.startswith("INSERT INTO customers")
+            if "INSERT INTO customers" in query
         )
         self.assertEqual(result["status"], "success")
         self.assertTrue(connection.committed)
@@ -264,15 +266,13 @@ class IndependentAuditRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("SMARTPRINT_ENV=production", operations_guide)
 
-    def test_production_mode_rejects_root_database_user(self):
+    def test_production_mode_requires_postgres_database_url(self):
         environment = os.environ.copy()
+        environment.pop("DATABASE_URL", None)
         environment.update(
             {
                 "SMARTPRINT_ENV": "production",
                 "SMARTPRINT_ALLOWED_ORIGINS": "https://shop.example.test",
-                "SMARTPRINT_DB_HOST": "localhost",
-                "SMARTPRINT_DB_USER": "root",
-                "SMARTPRINT_DB_PASSWORD": "test-only-password",
                 "SMARTPRINT_SESSION_SECRET": "test-only-session-secret",
             }
         )
@@ -287,7 +287,7 @@ class IndependentAuditRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Configure a non-root production database user", result.stderr)
+        self.assertIn("DATABASE_URL must be set in production", result.stderr)
 
 
 if __name__ == "__main__":

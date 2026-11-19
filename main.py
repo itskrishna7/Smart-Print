@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, List
+from urllib.parse import urlparse
 import pymupdf
 from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Request
 from starlette.datastructures import UploadFile
@@ -23,7 +24,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-import mysql.connector
+import psycopg
+from psycopg import errors as psycopg_errors
+from psycopg.rows import dict_row
 import qrcode
 from io import BytesIO
 import asyncio
@@ -131,13 +134,15 @@ QRCODE_DIR = os.path.join(os.path.dirname(__file__), "qrcodes")
 FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 FRONTEND_INDEX = os.path.join(FRONTEND_DIST, "index.html")
 
-DB_HOST = os.getenv("SMARTPRINT_DB_HOST", "localhost")
-DB_PORT = int(os.getenv("SMARTPRINT_DB_PORT", "3306"))
-DB_USER = os.getenv("SMARTPRINT_DB_USER", "root")
-DB_PASSWORD = os.getenv("SMARTPRINT_DB_PASSWORD", "")
-DB_NAME = os.getenv("SMARTPRINT_DB_NAME", "smart_print")
-if not re.fullmatch(r"[A-Za-z0-9_]+", DB_NAME):
-    raise RuntimeError("SMARTPRINT_DB_NAME may contain only letters, numbers, and underscores.")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if APP_ENV == "production" and not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must be set in production.")
+if DATABASE_URL:
+    parsed_database_url = urlparse(DATABASE_URL)
+    if parsed_database_url.scheme not in {"postgres", "postgresql"}:
+        raise RuntimeError("DATABASE_URL must use the PostgreSQL scheme.")
+    if not parsed_database_url.hostname or not parsed_database_url.path.strip("/"):
+        raise RuntimeError("DATABASE_URL must include a PostgreSQL host and database name.")
 STORAGE_BACKEND = os.getenv(
     "SMARTPRINT_STORAGE_BACKEND",
     "supabase" if APP_ENV == "production" else "local",
@@ -146,13 +151,6 @@ if STORAGE_BACKEND not in {"local", "supabase"}:
     raise RuntimeError("SMARTPRINT_STORAGE_BACKEND must be 'local' or 'supabase'.")
 if APP_ENV == "production" and STORAGE_BACKEND != "supabase":
     raise RuntimeError("Production requires SMARTPRINT_STORAGE_BACKEND=supabase.")
-if APP_ENV == "production" and (
-    not DB_PASSWORD
-    or not os.getenv("SMARTPRINT_DB_HOST")
-    or not os.getenv("SMARTPRINT_DB_USER")
-    or DB_USER.lower() == "root"
-):
-    raise RuntimeError("Configure a non-root production database user, host, and password.")
 OBJECT_STORAGE = (
     SupabaseObjectStorage.from_environment()
     if STORAGE_BACKEND == "supabase"
@@ -184,16 +182,9 @@ def _hash_password(password: str) -> str:
 
 
 def get_db_connection():
-    return mysql.connector.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        ssl_ca=os.getenv("SMARTPRINT_DB_SSL_CA"),
-        ssl_verify_cert=True,
-        ssl_verify_identity=True,
-    )
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL must be configured to connect to PostgreSQL.")
+    return psycopg.connect(DATABASE_URL, connect_timeout=15, sslmode="require")
 
 
 def _local_storage_path(key: str) -> str:
@@ -305,24 +296,27 @@ def _consume_rate_limit(
     retry_after = 1
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         for scope_name, limit, window_seconds in scopes:
             bucket_key = _rate_limit_key(scope_name)
             cursor.execute(
                 """
                 INSERT INTO security_rate_limits (bucket_key, window_started_at, attempts)
-                VALUES (%s, UTC_TIMESTAMP(), 1)
-                ON DUPLICATE KEY UPDATE
-                    attempts = IF(
-                        TIMESTAMPDIFF(SECOND, window_started_at, UTC_TIMESTAMP()) >= %s,
-                        1,
-                        attempts + 1
-                    ),
-                    window_started_at = IF(
-                        TIMESTAMPDIFF(SECOND, window_started_at, UTC_TIMESTAMP()) >= %s,
-                        UTC_TIMESTAMP(),
-                        window_started_at
-                    )
+                VALUES (%s, CURRENT_TIMESTAMP, 1)
+                ON CONFLICT (bucket_key) DO UPDATE SET
+                    attempts = CASE
+                        WHEN EXTRACT(EPOCH FROM (
+                            CURRENT_TIMESTAMP - security_rate_limits.window_started_at
+                        )) >= %s THEN 1
+                        ELSE security_rate_limits.attempts + 1
+                    END,
+                    window_started_at = CASE
+                        WHEN EXTRACT(EPOCH FROM (
+                            CURRENT_TIMESTAMP - security_rate_limits.window_started_at
+                        )) >= %s THEN CURRENT_TIMESTAMP
+                        ELSE security_rate_limits.window_started_at
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
                 """,
                 (bucket_key, window_seconds, window_seconds),
             )
@@ -331,7 +325,9 @@ def _consume_rate_limit(
                 SELECT attempts,
                        GREATEST(
                            1,
-                           %s - TIMESTAMPDIFF(SECOND, window_started_at, UTC_TIMESTAMP())
+                           %s - FLOOR(EXTRACT(EPOCH FROM (
+                               CURRENT_TIMESTAMP - window_started_at
+                           )))::integer
                        ) AS retry_after
                 FROM security_rate_limits
                 WHERE bucket_key = %s
@@ -346,7 +342,7 @@ def _consume_rate_limit(
             cursor.execute(
                 """
                 DELETE FROM security_rate_limits
-                WHERE updated_at < UTC_TIMESTAMP() - INTERVAL 1 DAY
+                WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '1 day'
                 """
             )
         db.commit()
@@ -473,14 +469,14 @@ def _load_upload_intent(token: str) -> tuple[str, list[dict]]:
         raise HTTPException(status_code=404, detail="Direct uploads are not enabled.")
     intent_hash = _upload_intent_hash(token)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute(
             """
             SELECT manifest_json
             FROM upload_intents
             WHERE intent_hash = %s
-              AND expires_at > UTC_TIMESTAMP()
+              AND expires_at > CURRENT_TIMESTAMP
               AND consumed_at IS NULL
             """,
             (intent_hash,),
@@ -703,9 +699,9 @@ def _delete_upload_file(filename: str) -> bool:
 
 
 def cleanup_expired_files() -> dict[str, int]:
-    cutoff = datetime.now() - timedelta(days=FILE_RETENTION_DAYS)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FILE_RETENTION_DAYS)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     removed_documents = 0
     removed_batch_exports = 0
     try:
@@ -1145,25 +1141,27 @@ def register_owner(
     cursor = db.cursor()
     try:
         cursor.execute(
-            "INSERT INTO shop_owners (shop_name, username, password) VALUES (%s, %s, %s)",
+            """
+            INSERT INTO shop_owners (shop_name, username, password)
+            VALUES (%s, %s, %s)
+            RETURNING owner_id
+            """,
             (shop_name, username, _hash_password(password)),
         )
-        owner_id = cursor.lastrowid
+        owner_id = cursor.fetchone()[0]
         db.commit()
         logger.info("security_event event=auth_registration_succeeded client_ip=%s", _client_ip(request))
         return {"status": "success", "message": "Shop registered successfully!", "owner_id": owner_id}
-    except mysql.connector.IntegrityError as error:
+    except psycopg_errors.UniqueViolation:
         db.rollback()
-        if error.errno == 1062:
-            logger.warning(
-                "security_event event=auth_registration_rejected client_ip=%s reason=registration_conflict",
-                _client_ip(request),
-            )
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to complete registration with the supplied details.",
-            ) from None
-        raise
+        logger.warning(
+            "security_event event=auth_registration_rejected client_ip=%s reason=registration_conflict",
+            _client_ip(request),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to complete registration with the supplied details.",
+        ) from None
     finally:
         cursor.close()
         db.close()
@@ -1176,9 +1174,12 @@ def login_owner(request: Request, username: str = Form(...), password: str = For
         logger.warning("security_event event=auth_login_failed client_ip=%s", _client_ip(request))
         raise HTTPException(status_code=401, detail="Invalid username or password.")
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
-        cursor.execute("SELECT * FROM shop_owners WHERE username = %s", (username,))
+        cursor.execute(
+            "SELECT * FROM shop_owners WHERE LOWER(username) = LOWER(%s)",
+            (username,),
+        )
         user = cursor.fetchone()
         password_valid, needs_upgrade = _verify_password(password, user.get("password") if user else None)
         if not user or not password_valid:
@@ -1215,7 +1216,7 @@ def login_owner(request: Request, username: str = Form(...), password: str = For
 def get_owner_session(request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute(
             "SELECT owner_id, shop_name FROM shop_owners WHERE owner_id = %s",
@@ -1289,13 +1290,13 @@ async def presign_customer_upload(payload: PresignUploadRequest, request: Reques
         })
 
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+    expires_at = datetime.now(timezone.utc) + timedelta(
         seconds=UPLOAD_INTENT_TTL_SECONDS
     )
     db = get_db_connection()
     cursor = db.cursor()
     try:
-        cursor.execute("DELETE FROM upload_intents WHERE expires_at <= UTC_TIMESTAMP()")
+        cursor.execute("DELETE FROM upload_intents WHERE expires_at <= CURRENT_TIMESTAMP")
         cursor.execute(
             """
             INSERT INTO upload_intents (intent_hash, manifest_json, expires_at)
@@ -1406,9 +1407,9 @@ def _persist_customer_order(
             cursor.execute(
                 """
                 UPDATE upload_intents
-                SET consumed_at = UTC_TIMESTAMP()
+                SET consumed_at = CURRENT_TIMESTAMP
                 WHERE intent_hash = %s
-                  AND expires_at > UTC_TIMESTAMP()
+                  AND expires_at > CURRENT_TIMESTAMP
                   AND consumed_at IS NULL
                 """,
                 (upload_intent_hash,),
@@ -1423,18 +1424,26 @@ def _persist_customer_order(
         branch = cursor.fetchone()
         if not branch:
             cursor.execute(
-                "INSERT INTO branches (owner_id, branch_name, branch_code, address) VALUES (%s, %s, %s, %s)",
+                """
+                INSERT INTO branches (owner_id, branch_name, branch_code, address)
+                VALUES (%s, %s, %s, %s)
+                RETURNING branch_id
+                """,
                 (owner_id, "Main Branch", f"SP{uuid.uuid4().hex[:8].upper()}", ""),
             )
-            branch_id = cursor.lastrowid
+            branch_id = cursor.fetchone()[0]
         else:
             branch_id = branch[0]
 
         cursor.execute(
-            "INSERT INTO customers (name, phone, email, owner_id) VALUES (%s, %s, %s, %s)",
+            """
+            INSERT INTO customers (name, phone, email, owner_id)
+            VALUES (%s, %s, %s, %s)
+            RETURNING customer_id
+            """,
             (customer_name, customer_phone, customer_email, owner_id),
         )
-        customer_id = cursor.lastrowid
+        customer_id = cursor.fetchone()[0]
 
         order_id = None
         for _ in range(10):
@@ -1454,7 +1463,7 @@ def _persist_customer_order(
         """, (
             order_id, customer_id, owner_id, branch_id, ", ".join(original_names)[:255],
             total_pages, bw_pages, color_pages, total_price, "Pending", "Waiting",
-            datetime.now() + timedelta(hours=2), _tracking_token_hash(tracking_token),
+            datetime.now(timezone.utc) + timedelta(hours=2), _tracking_token_hash(tracking_token),
         ))
         cursor.execute(
             "INSERT INTO order_history (order_id, owner_id, action, status) VALUES (%s, %s, %s, %s)",
@@ -1533,7 +1542,7 @@ def _persist_customer_order(
 def get_printing_profiles(request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute(
             "SELECT * FROM printing_profiles WHERE owner_id = %s ORDER BY profile_name",
@@ -1568,11 +1577,12 @@ def create_printing_profile(payload: PrintingProfilePayload, request: Request):
             INSERT INTO printing_profiles
                 (owner_id, profile_name, printer_id, paper_size, orientation, color_mode, duplex, quality, copies)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING profile_id
         """, (
             owner_id, profile["profile_name"], profile["printer_id"], profile["paper_size"],
             profile["orientation"], profile["color_mode"], profile["duplex"], profile["quality"], profile["copies"],
         ))
-        profile_id = cursor.lastrowid
+        profile_id = cursor.fetchone()[0]
         db.commit()
         return {"status": "success", "data": {"profile_id": profile_id, **profile}}
     except Exception:
@@ -1651,7 +1661,7 @@ def delete_printing_profile(profile_id: int, request: Request):
 def search_reprint_orders(request: Request, q: str = ""):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         query = """
             SELECT o.order_id, o.customer_id, o.owner_id, o.filename, o.total_pages,
@@ -1678,7 +1688,7 @@ def search_reprint_orders(request: Request, q: str = ""):
 def get_order_documents(order_id: str, request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute("SELECT filename FROM orders WHERE order_id = %s AND owner_id = %s", (order_id, owner_id))
         order = cursor.fetchone()
@@ -1723,7 +1733,7 @@ def get_order_documents(order_id: str, request: Request):
 def download_order_document(order_id: str, document_id: int, request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute("""
             SELECT d.storage_filename, d.original_filename
@@ -1752,7 +1762,7 @@ def download_order_document(order_id: str, document_id: int, request: Request):
 def download_legacy_order_document(order_id: str, request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute(
             "SELECT filename FROM orders WHERE order_id = %s AND owner_id = %s",
@@ -1788,7 +1798,7 @@ def download_batch_file(filename: str, request: Request):
 def get_order_print_settings(order_id: str, request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute("SELECT order_id FROM orders WHERE order_id = %s AND owner_id = %s", (order_id, owner_id))
         if not cursor.fetchone():
@@ -1828,7 +1838,7 @@ def confirm_order_print_settings(order_id: str, payload: PrintSettingsConfirmati
     owner_id = _owner_id(http_request)
     _require_matching_owner(payload.owner_id, owner_id)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute("SELECT order_id FROM orders WHERE order_id = %s AND owner_id = %s", (order_id, owner_id))
         if not cursor.fetchone():
@@ -1862,7 +1872,7 @@ def confirm_order_print_settings(order_id: str, payload: PrintSettingsConfirmati
 def get_reprint_details(order_id: str, request: Request, profile_id: int | None = None):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute("""
             SELECT order_id, customer_id, owner_id, branch_id, filename, total_pages,
@@ -1947,7 +1957,7 @@ def create_smart_reprint(
     owner_id = _owner_id(http_request)
     _require_matching_owner(payload.owner_id, owner_id)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     copied_paths = []
     qr_path = None
     try:
@@ -2040,7 +2050,7 @@ def create_smart_reprint(
         """, (
             new_order_id, source_order["customer_id"], source_order["owner_id"], source_order["branch_id"],
             ", ".join(item[0] for item in source_documents)[:255], total_pages, bw_pages, color_pages,
-            total_price, "Pending", "Waiting", datetime.now() + timedelta(hours=2),
+            total_price, "Pending", "Waiting", datetime.now(timezone.utc) + timedelta(hours=2),
             _tracking_token_hash(tracking_token),
         ))
         cursor.execute(
@@ -2109,7 +2119,7 @@ def get_all_orders(request: Request):
     owner_id = _owner_id(request)
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         cursor.execute(
             """
             SELECT order_id, customer_id, owner_id, branch_id, filename, total_pages,
@@ -2130,7 +2140,7 @@ def get_all_orders(request: Request):
 @app.get("/orders/{order_id}")
 def get_order(order_id: str, request: Request, tracking_token: str | None = None):
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         owner_id = getattr(request.state, "owner_id", None)
         if owner_id:
@@ -2174,7 +2184,7 @@ def merge_documents(payload: MergeRequest, request: Request):
         raise HTTPException(status_code=400, detail="Select no more than 100 orders for one batch.")
     placeholders = ",".join(["%s"] * len(payload.order_ids))
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     selected_order_ids = []
     try:
         cursor.execute(
@@ -2296,7 +2306,7 @@ def merge_documents(payload: MergeRequest, request: Request):
 def complete_and_delete_order(order_id: str, background_tasks: BackgroundTasks, request: Request):
     owner_id = _owner_id(request)
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         cursor.execute(
             "SELECT owner_id, order_status FROM orders WHERE order_id = %s AND owner_id = %s",
@@ -2339,7 +2349,7 @@ def track_order(order_id: str):
 def get_order_qr(order_id: str, request: Request, tracking_token: str | None = None):
     session_owner_id = _decode_session(request.cookies.get(SESSION_COOKIE_NAME))
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         if session_owner_id:
             cursor.execute(
@@ -2448,7 +2458,7 @@ def add_printer(
 def get_inventory(request: Request, branch_id: int = None):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         if branch_id:
             cursor.execute(
@@ -2482,7 +2492,14 @@ def update_inventory(request: Request, inventory_id: int = Form(...), current_st
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Inventory item not found for this shop.")
         cursor.execute(
-            "UPDATE inventory i JOIN branches b ON b.branch_id = i.branch_id SET i.current_stock = %s WHERE i.inventory_id = %s AND b.owner_id = %s",
+            """
+            UPDATE inventory AS i
+            SET current_stock = %s
+            FROM branches AS b
+            WHERE b.branch_id = i.branch_id
+              AND i.inventory_id = %s
+              AND b.owner_id = %s
+            """,
             (current_stock, inventory_id, owner_id),
         )
         db.commit()
@@ -2525,7 +2542,7 @@ def get_notifications(user_type: str, user_id: int, request: Request):
         if user_type != "owner" or user_id != owner_id:
             raise HTTPException(status_code=403, detail="Notifications are only available to this shop owner.")
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         cursor.execute("SELECT * FROM notifications WHERE user_type = %s AND user_id = %s ORDER BY created_at DESC", 
                       (user_type, user_id))
         notifications = cursor.fetchall()
@@ -2564,7 +2581,7 @@ def send_email_notification(
 @app.get("/progress/{order_id}")
 def get_progress(order_id: str, request: Request, tracking_token: str | None = None):
     db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(row_factory=dict_row)
     try:
         owner_id = getattr(request.state, "owner_id", None)
         if owner_id:
@@ -2591,30 +2608,41 @@ def get_progress(order_id: str, request: Request, tracking_token: str | None = N
 def get_revenue_analytics(request: Request, period: str = "monthly", branch_id: int = None):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         branch_clause = " AND branch_id = %s" if branch_id else ""
         params = (owner_id, branch_id) if branch_id else (owner_id,)
         if period == "daily":
             cursor.execute("""
-                SELECT DATE(created_at) as date, SUM(total_price) as daily_revenue, COUNT(order_id) as order_count
+                SELECT DATE(created_at AT TIME ZONE 'UTC') AS date,
+                       SUM(total_price) AS daily_revenue,
+                       COUNT(order_id) AS order_count
                 FROM orders WHERE owner_id = %s AND order_status = 'Completed'
                 """ + branch_clause + """
-                GROUP BY DATE(created_at) ORDER BY date DESC LIMIT 30
+                GROUP BY DATE(created_at AT TIME ZONE 'UTC')
+                ORDER BY date DESC LIMIT 30
             """, params)
         elif period == "monthly":
             cursor.execute("""
-                SELECT MONTH(created_at) as month, YEAR(created_at) as year, SUM(total_price) as monthly_revenue, COUNT(order_id) as order_count
+                SELECT EXTRACT(MONTH FROM created_at AT TIME ZONE 'UTC')::integer AS month,
+                       EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC')::integer AS year,
+                       SUM(total_price) AS monthly_revenue,
+                       COUNT(order_id) AS order_count
                 FROM orders WHERE owner_id = %s AND order_status = 'Completed'
                 """ + branch_clause + """
-                GROUP BY YEAR(created_at), MONTH(created_at) ORDER BY year DESC, month DESC LIMIT 12
+                GROUP BY EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC'),
+                         EXTRACT(MONTH FROM created_at AT TIME ZONE 'UTC')
+                ORDER BY year DESC, month DESC LIMIT 12
             """, params)
         elif period == "yearly":
             cursor.execute("""
-                SELECT YEAR(created_at) as year, SUM(total_price) as yearly_revenue, COUNT(order_id) as order_count
+                SELECT EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC')::integer AS year,
+                       SUM(total_price) AS yearly_revenue,
+                       COUNT(order_id) AS order_count
                 FROM orders WHERE owner_id = %s AND order_status = 'Completed'
                 """ + branch_clause + """
-                GROUP BY YEAR(created_at) ORDER BY year DESC LIMIT 5
+                GROUP BY EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC')
+                ORDER BY year DESC LIMIT 5
             """, params)
         else:
             raise HTTPException(status_code=400, detail="Period must be daily, monthly, or yearly.")
@@ -2630,30 +2658,38 @@ def get_revenue_analytics(request: Request, period: str = "monthly", branch_id: 
 def get_orders_trend(request: Request, period: str = "monthly", branch_id: int = None):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         branch_clause = " AND branch_id = %s" if branch_id else ""
         params = (owner_id, branch_id) if branch_id else (owner_id,)
         if period == "daily":
             cursor.execute("""
-                SELECT DATE(created_at) as date, COUNT(order_id) as order_count
+                SELECT DATE(created_at AT TIME ZONE 'UTC') AS date,
+                       COUNT(order_id) AS order_count
                 FROM orders WHERE owner_id = %s
                 """ + branch_clause + """
-                GROUP BY DATE(created_at) ORDER BY date DESC LIMIT 30
+                GROUP BY DATE(created_at AT TIME ZONE 'UTC')
+                ORDER BY date DESC LIMIT 30
             """, params)
         elif period == "monthly":
             cursor.execute("""
-                SELECT MONTH(created_at) as month, YEAR(created_at) as year, COUNT(order_id) as order_count
+                SELECT EXTRACT(MONTH FROM created_at AT TIME ZONE 'UTC')::integer AS month,
+                       EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC')::integer AS year,
+                       COUNT(order_id) AS order_count
                 FROM orders WHERE owner_id = %s
                 """ + branch_clause + """
-                GROUP BY YEAR(created_at), MONTH(created_at) ORDER BY year DESC, month DESC LIMIT 12
+                GROUP BY EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC'),
+                         EXTRACT(MONTH FROM created_at AT TIME ZONE 'UTC')
+                ORDER BY year DESC, month DESC LIMIT 12
             """, params)
         elif period == "yearly":
             cursor.execute("""
-                SELECT YEAR(created_at) as year, COUNT(order_id) as order_count
+                SELECT EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC')::integer AS year,
+                       COUNT(order_id) AS order_count
                 FROM orders WHERE owner_id = %s
                 """ + branch_clause + """
-                GROUP BY YEAR(created_at) ORDER BY year DESC LIMIT 5
+                GROUP BY EXTRACT(YEAR FROM created_at AT TIME ZONE 'UTC')
+                ORDER BY year DESC LIMIT 5
             """, params)
         else:
             raise HTTPException(status_code=400, detail="Period must be daily, monthly, or yearly.")
@@ -2669,7 +2705,7 @@ def get_orders_trend(request: Request, period: str = "monthly", branch_id: int =
 def get_color_bw_ratio(request: Request, branch_id: int = None):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         query = """
             SELECT 
@@ -2710,7 +2746,7 @@ def get_color_bw_ratio(request: Request, branch_id: int = None):
 def get_inventory_analytics(request: Request, branch_id: int = None):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         if branch_id:
             cursor.execute("""
@@ -2746,7 +2782,7 @@ def get_inventory_analytics(request: Request, branch_id: int = None):
 def get_printers_status(request: Request):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         cursor.execute("""
             SELECT p.* FROM printers p
@@ -2766,7 +2802,7 @@ def get_printers_status(request: Request):
 def search_orders(search_type: str, value: str, request: Request):
     try:
         db = get_db_connection()
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor(row_factory=dict_row)
         owner_id = _owner_id(request)
         query = "SELECT * FROM orders WHERE owner_id = %s AND "
         params = [owner_id]
